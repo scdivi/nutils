@@ -22,8 +22,8 @@
 The cache module.
 """
 
-from . import log, types
-import os, numpy, functools, inspect, builtins, pathlib, pickle, itertools, hashlib, abc, contextlib
+from . import types
+import os, numpy, functools, inspect, builtins, pathlib, pickle, itertools, hashlib, abc, contextlib, treelog as log
 
 class Wrapper:
   'function decorator that caches results by arguments'
@@ -223,7 +223,7 @@ def function(func=None, *, version=0):
           fail = False
         else:
           log_, fail, value = data
-      except (EOFError, pickle.UnpicklingError):
+      except (EOFError, pickle.UnpicklingError, IndexError):
         log.debug('[cache.function {}] failed to load, cache will be rewritten'.format(hkey))
         pass
       else:
@@ -236,7 +236,8 @@ def function(func=None, *, version=0):
       # Seek back to the beginning, because pickle might have read garbage.
       f.seek(0)
       # Disable the cache temporarily to prevent caching subresults *in* `func`.
-      with disable(), log.RecordLog() as log_:
+      log_ = log.RecordLog()
+      with disable(), log.add(log_):
         try:
           value = func(*args, **kwargs)
         except Exception as e:
@@ -379,42 +380,41 @@ class Recursion(types.Immutable, metaclass=_RecursionMeta):
           if not exhausted:
             try:
               log_, stop, value = pickle.load(f)
-            except pickle.UnpicklingError:
+            except (pickle.UnpicklingError, IndexError):
               log.debug('[cache.Recursion {}.{:04d}] failed to load, cache will be rewritten from this point'.format(hkey, i))
+              exhausted = True
             except EOFError:
               log.debug('[cache.Recursion {}.{:04d}] cache exhausted'.format(hkey, i))
+              exhausted = True
             else:
               log.debug('[cache.Recursion {}.{:04d}] load'.format(hkey, i))
               log_.replay()
-              if not stop:
-                yield value
-              elif value is None or isinstance(value, StopIteration):
-                return
-              else:
-                raise value
+              if stop and value is None:
+                value = StopIteration
               history.append(value)
               if len(history) > length:
                 history = history[1:]
-              continue
-            exhausted = True
-            resume = self.resume(history)
-            f.seek(0)
-            del history
-          # Disable the cache temporarily to prevent caching subresults *in* `func`.
-          with disable(), log.RecordLog() as log_:
-            try:
-              value = next(resume)
-            except Exception as e:
-              stop = True
-              value = e
-          log.debug('[cache.Recursion {}.{}] store'.format(hkey, i))
-          pickle.dump((log_, stop, value), f)
-          if not stop:
-            yield value
-          elif isinstance(value, StopIteration):
-            return
-          else:
-            raise value
+            if exhausted:
+              resume = self.resume(history)
+              f.seek(0)
+              del history
+          if exhausted:
+            # Disable the cache temporarily to prevent caching subresults *in* `func`.
+            log_ = log.RecordLog()
+            with disable(), log.add(log_):
+              try:
+                value = next(resume)
+              except Exception as e:
+                stop = True
+                value = e
+            log.debug('[cache.Recursion {}.{}] store'.format(hkey, i))
+            pickle.dump((log_, stop, value), f)
+        if not stop:
+          yield value
+        elif isinstance(value, StopIteration):
+          return
+        else:
+          raise value
 
   @abc.abstractmethod
   def resume(self, history):

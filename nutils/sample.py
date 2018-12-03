@@ -43,8 +43,8 @@ multiple integrals simultaneously, which has the advantage that it can
 efficiently combine common substructures.
 '''
 
-from . import types, points, log, util, function, config, parallel, numeric, cache, matrix
-import numpy, numbers, collections.abc
+from . import types, points, util, function, config, parallel, numeric, cache, matrix
+import numpy, numbers, collections.abc, treelog as log
 
 def argdict(arguments):
   if len(arguments) == 1 and 'arguments' in arguments and isinstance(arguments['arguments'], collections.abc.Mapping):
@@ -162,19 +162,26 @@ class Sample(types.Singleton):
     # benefits from parallel speedup.
 
     valueindexfunc = function.Tuple(function.Tuple([value]+list(index)) for value, index in zip(values, indices))
-    for ielem in parallel.pariter(log.range('elem', self.nelems), nprocs=nprocs):
-      points = self.points[ielem]
-      for iblock, (intdata, *indices) in enumerate(valueindexfunc.eval(_transforms=self.transforms[ielem], _points=points.coords, **arguments)):
-        s = slice(*offsets[iblock,ielem:ielem+2])
-        data, index = data_index[block2func[iblock]]
-        w_intdata = numeric.dot(points.weights, intdata)
-        data[s] = w_intdata.ravel()
-        si = (slice(None),) + (numpy.newaxis,) * (w_intdata.ndim-1)
-        for idim, (ii,) in enumerate(indices):
-          index[idim,s].reshape(w_intdata.shape)[...] = ii[si]
-          si = si[:-1]
+    ielems = parallel.range(self.nelems)
+    with parallel.fork(nprocs):
+      for ielem in ielems:
+        with log.context('elem', ielem, '({:.0f}%)'.format(100*ielem/self.nelems)):
+          points = self.points[ielem]
+          for iblock, (intdata, *indices) in enumerate(valueindexfunc.eval(_transforms=self.transforms[ielem], _points=points.coords, **arguments)):
+            s = slice(*offsets[iblock,ielem:ielem+2])
+            data, index = data_index[block2func[iblock]]
+            w_intdata = numeric.dot(points.weights, intdata)
+            data[s] = w_intdata.ravel()
+            si = (slice(None),) + (numpy.newaxis,) * (w_intdata.ndim-1)
+            for idim, (ii,) in enumerate(indices):
+              index[idim,s].reshape(w_intdata.shape)[...] = ii[si]
+              si = si[:-1]
 
-    return [matrix.assemble(data, index, func.shape) for func, (data,index) in log.zip('assembling', funcs, data_index)]
+    retvals = []
+    for i, func in enumerate(funcs):
+      with log.context('assembling {}/{}'.format(i+1, len(funcs))):
+        retvals.append(matrix.assemble(*data_index[i], shape=func.shape))
+    return retvals
 
   def integral(self, func):
     '''Create Integral object for postponed integration.
@@ -213,9 +220,12 @@ class Sample(types.Singleton):
     if config.dot:
       idata.graphviz()
 
-    for transforms, points, index in parallel.pariter(log.zip('elem', self.transforms, self.points, self.index), nprocs=nprocs):
-      for ifunc, inds, data in idata.eval(_transforms=transforms, _points=points.coords, **arguments):
-        numpy.add.at(retvals[ifunc], numpy.ix_(index, *[ind for (ind,) in inds]), data)
+    ielems = parallel.range(self.nelems)
+    with parallel.fork(nprocs):
+      for ielem in ielems:
+        with log.context('elem', ielem, '({:.0f}%)'.format(100*ielem/self.nelems)):
+          for ifunc, inds, data in idata.eval(_transforms=self.transforms[ielem], _points=self.points[ielem].coords, **arguments):
+            numpy.add.at(retvals[ifunc], numpy.ix_(self.index[ielem], *[ind for (ind,) in inds]), data)
 
     return retvals
 
